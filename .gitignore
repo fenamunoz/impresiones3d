@@ -1,0 +1,5 @@
+.streamlit/
+*.db
+prueba_makerworld.py
+__pycache__/
+*.pyc
