@@ -1359,9 +1359,17 @@ if pagina_activa == "➕ Nueva impresión":
 
                 plan = []
                 for filamento in resultado["filamentos"]:
+                    material_original = str(
+                        filamento.get("Material", "PLA")
+                    ).upper()
+                    color_original = str(
+                        filamento.get("Color", "SIN COLOR")
+                    ).upper()
                     plan.append({
-                        "Material": str(filamento.get("Material", "PLA")).upper(),
-                        "Color": str(filamento.get("Color", "SIN COLOR")).upper(),
+                        "Material": material_original,
+                        "Color": color_original,
+                        "Material original": material_original,
+                        "Color original": color_original,
                         "Gramos modelo": numero_seguro(filamento.get("Gramos", 0)),
                         "Purga extra": 0.0
                     })
@@ -1391,6 +1399,24 @@ if pagina_activa == "➕ Nueva impresión":
 
         inventario_actual = cargar_inventario()
         plan_df = st.session_state.get("materiales_plan", pd.DataFrame()).copy()
+
+        # Conservamos siempre la referencia original de MakerWorld para que,
+        # aunque el usuario cambie los colores, pueda ver qué estaba reemplazando.
+        # También cubre sesiones abiertas antes de esta versión de la app.
+        if not plan_df.empty:
+            originales_mw = pd.DataFrame(resultado.get("filamentos", []))
+            if "Material original" not in plan_df.columns:
+                plan_df["Material original"] = [
+                    str(originales_mw.iloc[i].get("Material", "PLA")).upper()
+                    if i < len(originales_mw) else str(plan_df.iloc[i].get("Material", "PLA")).upper()
+                    for i in range(len(plan_df))
+                ]
+            if "Color original" not in plan_df.columns:
+                plan_df["Color original"] = [
+                    str(originales_mw.iloc[i].get("Color", "SIN COLOR")).upper()
+                    if i < len(originales_mw) else str(plan_df.iloc[i].get("Color", "SIN COLOR")).upper()
+                    for i in range(len(plan_df))
+                ]
 
         if plan_df.empty:
             st.error("MakerWorld no entregó materiales para esta impresión.")
@@ -1452,7 +1478,15 @@ if pagina_activa == "➕ Nueva impresión":
                 return opcion_vacia
 
             editor_base = pd.DataFrame({
-                "Color": [
+                "Original MakerWorld": [
+                    (
+                        f"{emoji_color(str(fila.get('Color original', 'SIN COLOR')).upper())} "
+                        f"{str(fila.get('Color original', 'SIN COLOR')).upper()} "
+                        f"({str(fila.get('Material original', fila.get('Material', 'PLA'))).upper()})"
+                    )
+                    for _, fila in plan_df.iterrows()
+                ],
+                "Color elegido": [
                     buscar_etiqueta(fila.get("Material"), fila.get("Color"))
                     for _, fila in plan_df.iterrows()
                 ],
@@ -1508,8 +1542,14 @@ if pagina_activa == "➕ Nueva impresión":
                         f"{st.session_state.get('materiales_editor_version', 0)}"
                     ),
                     column_config={
-                        "Color": st.column_config.SelectboxColumn(
-                            "Color",
+                        "Original MakerWorld": st.column_config.TextColumn(
+                            "Original MakerWorld",
+                            disabled=True,
+                            width="medium",
+                            help="Color/material que venía definido en el perfil de MakerWorld."
+                        ),
+                        "Color elegido": st.column_config.SelectboxColumn(
+                            "Color elegido",
                             options=opciones_editor,
                             required=True,
                             width="large",
@@ -1531,22 +1571,37 @@ if pagina_activa == "➕ Nueva impresión":
             # Convertimos la selección visible del inventario a Material + Color.
             filas_reales = []
             filas_sin_color = 0
-            for _, fila_editada in materiales_editor.iterrows():
-                etiqueta = str(fila_editada.get("Color", opcion_vacia))
+            for i, fila_editada in materiales_editor.iterrows():
+                etiqueta = str(fila_editada.get("Color elegido", opcion_vacia))
                 gramos_modelo = numero_seguro(fila_editada.get("Gramos", 0))
                 info = opciones_inventario.get(etiqueta)
+
+                if i < len(plan_df):
+                    material_original = str(
+                        plan_df.iloc[i].get("Material original", plan_df.iloc[i].get("Material", "PLA"))
+                    ).upper()
+                    color_original = str(
+                        plan_df.iloc[i].get("Color original", plan_df.iloc[i].get("Color", "SIN COLOR"))
+                    ).upper()
+                else:
+                    material_original = ""
+                    color_original = ""
 
                 if info is None:
                     filas_sin_color += 1
                     filas_reales.append({
                         "Material": "",
                         "Color": "",
+                        "Material original": material_original,
+                        "Color original": color_original,
                         "Gramos modelo": gramos_modelo
                     })
                 else:
                     filas_reales.append({
                         "Material": info["Material"],
                         "Color": info["Color"],
+                        "Material original": material_original,
+                        "Color original": color_original,
                         "Gramos modelo": gramos_modelo
                     })
 
@@ -1598,7 +1653,12 @@ if pagina_activa == "➕ Nueva impresión":
             purga_total = peso_modelo * purga_pct / 100
             consumo_total = peso_modelo + purga_total
 
-            costo_material = consumo_total / 1000 * precio_filamento_kg
+            # Separamos el costo del material que queda en la pieza del costo
+            # correspondiente a la purga. El costo_material total sigue incluyendo ambos.
+            costo_material_modelo = peso_modelo / 1000 * precio_filamento_kg
+            costo_purga = purga_total / 1000 * precio_filamento_kg
+            costo_material = costo_material_modelo + costo_purga
+
             costo_electricidad = (
                 tiempo_editado * consumo_impresora_w / 1000 * precio_kwh
             )
@@ -1607,23 +1667,33 @@ if pagina_activa == "➕ Nueva impresión":
             )
             costo_total = costo_material + costo_electricidad + costo_depreciacion
 
+            # La purga vive junto a la elección de colores, porque forma parte
+            # de la decisión de material. A la derecha dejamos solo el costo total.
+            with col_colores:
+                purga_col, consumo_col = st.columns([1.05, 1.35])
+                with purga_col:
+                    purga_pct_widget = st.number_input(
+                        "Purga estimada (%)",
+                        min_value=0.0,
+                        max_value=300.0,
+                        step=1.0,
+                        key="purga_pct",
+                        on_change=marcar_purga_manual,
+                        help=(
+                            f"Sugerencia automática actual: {purga_sugerida:.0f}% "
+                            "(5% un color / 10% multicolor). Puedes editarla."
+                        )
+                    )
+                with consumo_col:
+                    st.caption("Consumo de filamento")
+                    st.markdown(
+                        f"**{peso_modelo:.0f} g modelo + "
+                        f"{purga_total:.0f} g purga = {consumo_total:.0f} g**"
+                    )
+
             with col_total:
                 st.caption("💰 Costo total")
                 st.markdown(f"## {formatear_clp(costo_total)}")
-                st.caption(f"Modelo: {peso_modelo:.0f} g")
-                st.caption(f"Consumo estimado: {consumo_total:.0f} g")
-                st.number_input(
-                    "Purga estimada (%)",
-                    min_value=0.0,
-                    max_value=300.0,
-                    step=1.0,
-                    key="purga_pct",
-                    on_change=marcar_purga_manual,
-                    help=(
-                        f"Sugerencia automática actual: {purga_sugerida:.0f}% "
-                        "(5% un color / 10% multicolor). Puedes editarla."
-                    )
-                )
 
             # El number_input puede haber cambiado en esta misma ejecución;
             # recalculamos con el valor definitivo.
@@ -1670,8 +1740,12 @@ if pagina_activa == "➕ Nueva impresión":
                             nuevo_plan = plan_df.copy()
                             nuevo_plan["Material"] = info_unica["Material"]
                             nuevo_plan["Color"] = info_unica["Color"]
+                            columnas_plan = [
+                                "Material", "Color", "Material original",
+                                "Color original", "Gramos modelo"
+                            ]
                             st.session_state["materiales_plan"] = nuevo_plan[
-                                ["Material", "Color", "Gramos modelo"]
+                                [c for c in columnas_plan if c in nuevo_plan.columns]
                             ].copy()
                             st.session_state["materiales_editor_version"] = (
                                 st.session_state.get("materiales_editor_version", 0) + 1
@@ -1726,15 +1800,18 @@ if pagina_activa == "➕ Nueva impresión":
             with st.expander("💰 Ver desglose de costos"):
                 d1, d2, d3, d4 = st.columns(4)
                 with d1:
-                    st.metric("🧵 Material", formatear_clp(costo_material))
+                    st.metric(
+                        "🧵 Material del modelo",
+                        formatear_clp(costo_material_modelo)
+                    )
                 with d2:
                     st.metric("⚡ Electricidad", formatear_clp(costo_electricidad))
                 with d3:
                     st.metric("🖨️ Depreciación", formatear_clp(costo_depreciacion))
                 with d4:
                     st.metric(
-                        "🗑️ Purga",
-                        f"{purga_total:.0f} g ({purga_pct:.0f}%)"
+                        "🗑️ Costo de purga",
+                        formatear_clp(costo_purga)
                     )
 
             ganancia = 0
