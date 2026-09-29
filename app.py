@@ -23,6 +23,11 @@ st.set_page_config(
 PERSONAS = ["Mauri", "Fabi", "Beto", "Pame", "Feña"]
 DESTINOS = PERSONAS + ["Venta"]
 
+MATERIALES_FILAMENTO = [
+    "PLA", "PLA+", "PETG", "TPU", "ABS", "ASA", "PC", "PA", "PVA", "OTRO"
+]
+STOCK_BAJO_G = 200
+
 
 CELESTE_UI = "#38BDF8"
 CELESTE_UI_CLARO = "#7DD3FC"
@@ -480,7 +485,7 @@ def obtener_datos_makerworld(url):
         color = nombre_color(codigo)
 
         filamentos.append({
-            "Material": f"{tipo} {color}",
+            "Material": tipo,
             "Gramos": gramos,
             "Color": color
         })
@@ -538,7 +543,12 @@ def guardar_impresion(
         "ganancia": _a_float(ganancia)
     }
 
-    conectar_db().table("impresiones").insert(fila).execute()
+    respuesta = conectar_db().table("impresiones").insert(fila).execute()
+
+    if not respuesta.data:
+        raise RuntimeError("No se pudo guardar la impresión en Supabase.")
+
+    return int(respuesta.data[0]["id"])
 
 
 def actualizar_impresion(
@@ -580,6 +590,277 @@ def eliminar_impresion(registro_id):
         .eq("id", _a_int(registro_id))
         .execute()
     )
+
+
+# =========================================================
+# INVENTARIO DE FILAMENTO
+# =========================================================
+
+def cargar_inventario():
+    respuesta = (
+        conectar_db()
+        .table("inventario_filamento")
+        .select("*")
+        .order("fecha_compra", desc=False)
+        .order("id", desc=False)
+        .execute()
+    )
+
+    columnas = [
+        "id", "fecha_compra", "material", "color", "marca",
+        "rollos_comprados", "gramos_por_rollo", "gramos_iniciales",
+        "gramos_disponibles", "precio_total", "nota", "created_at"
+    ]
+    df = pd.DataFrame(respuesta.data or [], columns=columnas)
+    if not df.empty:
+        df["fecha_compra"] = pd.to_datetime(df["fecha_compra"])
+    return df
+
+
+def cargar_movimientos_inventario(limite=300):
+    respuesta = (
+        conectar_db()
+        .table("movimientos_inventario")
+        .select("*")
+        .order("id", desc=True)
+        .limit(limite)
+        .execute()
+    )
+    columnas = [
+        "id", "fecha", "tipo", "inventario_id", "impresion_id",
+        "material", "color", "cantidad_g", "detalle"
+    ]
+    df = pd.DataFrame(respuesta.data or [], columns=columnas)
+    if not df.empty and "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"])
+    return df
+
+
+def agregar_filamento(
+    fecha_compra,
+    material,
+    color,
+    rollos,
+    gramos_por_rollo,
+    precio_total=0,
+    marca="",
+    nota=""
+):
+    material = str(material).strip().upper()
+    color = str(color).strip().upper()
+    total_g = _a_float(rollos) * _a_float(gramos_por_rollo)
+
+    fila = {
+        "fecha_compra": fecha_compra,
+        "material": material,
+        "color": color,
+        "marca": str(marca or "").strip(),
+        "rollos_comprados": _a_float(rollos),
+        "gramos_por_rollo": _a_float(gramos_por_rollo),
+        "gramos_iniciales": total_g,
+        "gramos_disponibles": total_g,
+        "precio_total": _a_float(precio_total),
+        "nota": str(nota or "").strip()
+    }
+
+    respuesta = (
+        conectar_db()
+        .table("inventario_filamento")
+        .insert(fila)
+        .execute()
+    )
+
+    if not respuesta.data:
+        raise RuntimeError("No se pudo agregar el filamento al inventario.")
+
+    inventario_id = int(respuesta.data[0]["id"])
+
+    conectar_db().table("movimientos_inventario").insert({
+        "tipo": "compra",
+        "inventario_id": inventario_id,
+        "impresion_id": None,
+        "material": material,
+        "color": color,
+        "cantidad_g": total_g,
+        "detalle": f"Compra de {rollos:g} rollo(s)"
+    }).execute()
+
+    return inventario_id
+
+
+def ajustar_stock_inventario(inventario_id, nuevo_stock_g, detalle="Ajuste manual"):
+    inventario = cargar_inventario()
+    fila = inventario[inventario["id"] == int(inventario_id)]
+    if fila.empty:
+        raise ValueError("No encontré ese lote de filamento.")
+
+    fila = fila.iloc[0]
+    stock_anterior = numero_seguro(fila["gramos_disponibles"])
+    nuevo_stock_g = max(0.0, _a_float(nuevo_stock_g))
+    diferencia = nuevo_stock_g - stock_anterior
+
+    (
+        conectar_db()
+        .table("inventario_filamento")
+        .update({"gramos_disponibles": nuevo_stock_g})
+        .eq("id", int(inventario_id))
+        .execute()
+    )
+
+    if abs(diferencia) > 1e-9:
+        conectar_db().table("movimientos_inventario").insert({
+            "tipo": "ajuste",
+            "inventario_id": int(inventario_id),
+            "impresion_id": None,
+            "material": str(fila["material"]),
+            "color": str(fila["color"]),
+            "cantidad_g": diferencia,
+            "detalle": str(detalle or "Ajuste manual")
+        }).execute()
+
+
+def stock_disponible(material, color, inventario_df=None):
+    if inventario_df is None:
+        inventario_df = cargar_inventario()
+    if inventario_df.empty:
+        return 0.0
+
+    material = str(material).strip().upper()
+    color = str(color).strip().upper()
+    mask = (
+        inventario_df["material"].fillna("").str.upper().eq(material)
+        & inventario_df["color"].fillna("").str.upper().eq(color)
+    )
+    return float(inventario_df.loc[mask, "gramos_disponibles"].fillna(0).sum())
+
+
+def agrupar_necesidades_inventario(materiales_df):
+    necesidades = {}
+    if materiales_df is None or materiales_df.empty:
+        return necesidades
+
+    for _, fila in materiales_df.iterrows():
+        material = str(fila.get("Material", "")).strip().upper()
+        color = str(fila.get("Color", "")).strip().upper()
+        total = numero_seguro(fila.get("Total a descontar", 0))
+        if material and color and total > 0:
+            clave = (material, color)
+            necesidades[clave] = necesidades.get(clave, 0.0) + total
+    return necesidades
+
+
+def validar_stock(necesidades, inventario_df=None):
+    if inventario_df is None:
+        inventario_df = cargar_inventario()
+
+    faltantes = []
+    for (material, color), necesario in necesidades.items():
+        disponible = stock_disponible(material, color, inventario_df)
+        if disponible + 1e-9 < necesario:
+            faltantes.append({
+                "Material": material,
+                "Color": color,
+                "Necesario": necesario,
+                "Disponible": disponible,
+                "Faltan": necesario - disponible
+            })
+    return faltantes
+
+
+def descontar_inventario(necesidades, impresion_id):
+    inventario = cargar_inventario()
+
+    # Validamos todo antes de tocar un solo gramo.
+    faltantes = validar_stock(necesidades, inventario)
+    if faltantes:
+        detalle = "; ".join(
+            f"{f['Material']} {f['Color']}: faltan {f['Faltan']:.0f} g"
+            for f in faltantes
+        )
+        raise ValueError("Stock insuficiente. " + detalle)
+
+    for (material, color), cantidad in necesidades.items():
+        restante = float(cantidad)
+        lotes = inventario[
+            inventario["material"].fillna("").str.upper().eq(material)
+            & inventario["color"].fillna("").str.upper().eq(color)
+            & (inventario["gramos_disponibles"].fillna(0) > 0)
+        ].sort_values(["fecha_compra", "id"])
+
+        for _, lote in lotes.iterrows():
+            if restante <= 1e-9:
+                break
+
+            disponible = numero_seguro(lote["gramos_disponibles"])
+            usar = min(disponible, restante)
+            nuevo_stock = disponible - usar
+
+            (
+                conectar_db()
+                .table("inventario_filamento")
+                .update({"gramos_disponibles": nuevo_stock})
+                .eq("id", int(lote["id"]))
+                .execute()
+            )
+
+            conectar_db().table("movimientos_inventario").insert({
+                "tipo": "impresion",
+                "inventario_id": int(lote["id"]),
+                "impresion_id": int(impresion_id),
+                "material": material,
+                "color": color,
+                "cantidad_g": -usar,
+                "detalle": f"Consumo impresión #{impresion_id}"
+            }).execute()
+
+            restante -= usar
+
+
+def devolver_stock_impresion(impresion_id):
+    respuesta = (
+        conectar_db()
+        .table("movimientos_inventario")
+        .select("*")
+        .eq("impresion_id", int(impresion_id))
+        .eq("tipo", "impresion")
+        .execute()
+    )
+
+    movimientos = respuesta.data or []
+    for mov in movimientos:
+        cantidad = abs(_a_float(mov.get("cantidad_g", 0)))
+        inventario_id = mov.get("inventario_id")
+        if not inventario_id or cantidad <= 0:
+            continue
+
+        lote_resp = (
+            conectar_db()
+            .table("inventario_filamento")
+            .select("gramos_disponibles")
+            .eq("id", int(inventario_id))
+            .execute()
+        )
+        if not lote_resp.data:
+            continue
+
+        stock_actual = _a_float(lote_resp.data[0]["gramos_disponibles"])
+        (
+            conectar_db()
+            .table("inventario_filamento")
+            .update({"gramos_disponibles": stock_actual + cantidad})
+            .eq("id", int(inventario_id))
+            .execute()
+        )
+
+        conectar_db().table("movimientos_inventario").insert({
+            "tipo": "devolucion",
+            "inventario_id": int(inventario_id),
+            "impresion_id": int(impresion_id),
+            "material": mov.get("material", ""),
+            "color": mov.get("color", ""),
+            "cantidad_g": cantidad,
+            "detalle": f"Devolución por eliminar impresión #{impresion_id}"
+        }).execute()
 
 
 # =========================================================
@@ -899,6 +1180,11 @@ def alternar_persona_pago(nombre):
     st.session_state["personas_pago"] = seleccionadas
 
 
+def marcar_purga_manual():
+    """Marca que el porcentaje de purga fue editado manualmente."""
+    st.session_state["purga_manual"] = True
+
+
 # =========================================================
 # SIDEBAR
 # =========================================================
@@ -987,6 +1273,7 @@ st.caption("Control de impresiones, costos, caja y pagos")
 
 PAGINAS = [
     "➕ Nueva impresión",
+    "🧵 Inventario",
     "📋 Historial",
     "💳 Registrar pago",
     "💰 Fondo común",
@@ -1068,223 +1355,627 @@ if pagina_activa == "➕ Nueva impresión":
                 st.session_state["resultado"] = resultado
                 st.session_state["link_calculado"] = link
                 st.session_state["destino_calculado"] = destino
-                st.session_state[
-                    "precio_venta_calculado"
-                ] = precio_venta
+                st.session_state["precio_venta_calculado"] = precio_venta
+
+                plan = []
+                for filamento in resultado["filamentos"]:
+                    plan.append({
+                        "Material": str(filamento.get("Material", "PLA")).upper(),
+                        "Color": str(filamento.get("Color", "SIN COLOR")).upper(),
+                        "Gramos modelo": numero_seguro(filamento.get("Gramos", 0)),
+                        "Purga extra": 0.0
+                    })
+                st.session_state["materiales_plan"] = pd.DataFrame(plan)
+                st.session_state["materiales_editor_version"] = (
+                    st.session_state.get("materiales_editor_version", 0) + 1
+                )
+                # Nueva impresión: volvemos a la purga automática sugerida.
+                st.session_state["purga_manual"] = False
+                st.session_state.pop("purga_pct", None)
+                st.session_state.pop("purga_sugerida_anterior", None)
 
             except Exception as error:
-                st.error(
-                    f"No pude leer el modelo: {error}"
-                )
+                st.error(f"No pude leer el modelo: {error}")
 
     if "resultado" in st.session_state:
         resultado = st.session_state["resultado"]
         destino_actual = st.session_state["destino_calculado"]
-        precio_venta_actual = st.session_state[
-            "precio_venta_calculado"
-        ]
+        precio_venta_actual = st.session_state["precio_venta_calculado"]
 
         st.divider()
-
         st.subheader(resultado["modelo"])
         st.caption(f"Perfil: {resultado['perfil']}")
-
         st.write("## Datos de impresión")
 
-        horas_iniciales, minutos_iniciales = separar_duracion(
-            resultado["horas"]
-        )
+        horas_iniciales, minutos_iniciales = separar_duracion(resultado["horas"])
 
-        tiempo_horas_col, tiempo_minutos_col = st.columns(2)
+        inventario_actual = cargar_inventario()
+        plan_df = st.session_state.get("materiales_plan", pd.DataFrame()).copy()
 
-        with tiempo_horas_col:
-            horas_editadas = st.number_input(
-                "⏱️ Horas",
-                min_value=0,
-                value=horas_iniciales,
-                step=1,
-                key="nueva_imp_horas"
-            )
+        if plan_df.empty:
+            st.error("MakerWorld no entregó materiales para esta impresión.")
+        else:
+            # ---------------------------------------------------------
+            # Opciones REALES del inventario: solo combinaciones con stock.
+            # El desplegable muestra el stock disponible, pero internamente
+            # seguimos guardando Material + Color por separado.
+            # ---------------------------------------------------------
+            opciones_inventario = {}
 
-        with tiempo_minutos_col:
-            minutos_editados = st.number_input(
-                "Minutos",
-                min_value=0,
-                max_value=59,
-                value=minutos_iniciales,
-                step=1,
-                key="nueva_imp_minutos"
-            )
+            if not inventario_actual.empty:
+                inventario_disponible = inventario_actual[
+                    inventario_actual["gramos_disponibles"].fillna(0) > 0
+                ].copy()
 
-        tiempo_editado = horas_editadas + minutos_editados / 60
-
-        st.write("🧵 **Materiales utilizados**")
-
-        materiales_base = pd.DataFrame(resultado["filamentos"])
-
-        if not materiales_base.empty:
-            columnas_materiales = st.columns(
-                min(len(materiales_base), 4)
-            )
-
-            for i, fila in materiales_base.iterrows():
-                color_nombre = fila.get("Color", "SIN COLOR")
-
-                with columnas_materiales[
-                    i % len(columnas_materiales)
-                ]:
-                    st.markdown(
-                        f"**{emoji_color(color_nombre)} "
-                        f"{fila['Material']} — "
-                        f"{fila['Gramos']:.0f} g**"
+                if not inventario_disponible.empty:
+                    agrupado_stock = (
+                        inventario_disponible
+                        .groupby(["material", "color"], as_index=False)["gramos_disponibles"]
+                        .sum()
                     )
 
-        df_materiales = materiales_base[
-            ["Material", "Gramos"]
-        ].copy()
+                    for _, fila_stock in agrupado_stock.iterrows():
+                        material_stock = str(fila_stock["material"]).strip().upper()
+                        color_stock = str(fila_stock["color"]).strip().upper()
+                        gramos_stock = numero_seguro(fila_stock["gramos_disponibles"])
+                        etiqueta = (
+                            f"{emoji_color(color_stock)} {color_stock} — "
+                            f"{gramos_stock:.0f} g disponibles ({material_stock})"
+                        )
+                        opciones_inventario[etiqueta] = {
+                            "Material": material_stock,
+                            "Color": color_stock,
+                            "Disponible": gramos_stock
+                        }
 
-        materiales_editados = st.data_editor(
-            df_materiales,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Material": st.column_config.TextColumn(
-                    "Material"
-                ),
-                "Gramos": st.column_config.NumberColumn(
-                    "Gramos",
-                    min_value=0.0,
-                    step=1.0,
-                    format="%.0f g"
+            etiquetas_disponibles = list(opciones_inventario.keys())
+            opcion_vacia = "— Selecciona un color del inventario —"
+            opciones_editor = [opcion_vacia] + etiquetas_disponibles
+
+            if not etiquetas_disponibles:
+                st.error(
+                    "No hay filamento con stock disponible. Agrega rollos en "
+                    "🧵 Inventario antes de registrar la impresión."
                 )
+
+            # ---------------------------------------------------------
+            # Si MakerWorld trae una combinación que sí existe, la usamos.
+            # Si no existe, dejamos la fila pendiente para que el usuario
+            # elija explícitamente un color disponible.
+            # ---------------------------------------------------------
+            def buscar_etiqueta(material, color):
+                material = str(material or "").strip().upper()
+                color = str(color or "").strip().upper()
+                for etiqueta, info in opciones_inventario.items():
+                    if info["Material"] == material and info["Color"] == color:
+                        return etiqueta
+                return opcion_vacia
+
+            editor_base = pd.DataFrame({
+                "Color": [
+                    buscar_etiqueta(fila.get("Material"), fila.get("Color"))
+                    for _, fila in plan_df.iterrows()
+                ],
+                "Gramos": pd.to_numeric(
+                    plan_df.get("Gramos modelo", pd.Series(dtype=float)),
+                    errors="coerce"
+                ).fillna(0).tolist()
+            })
+
+            # ---------------------------------------------------------
+            # Primera fila compacta: tiempo | colores | costo total.
+            # ---------------------------------------------------------
+            col_horas, col_minutos, col_colores, col_total = st.columns(
+                [0.55, 0.55, 2.7, 1.25],
+                vertical_alignment="top"
+            )
+
+            with col_horas:
+                st.caption("⏱️ Horas")
+                horas_editadas = st.number_input(
+                    "Horas",
+                    min_value=0,
+                    value=horas_iniciales,
+                    step=1,
+                    key="nueva_imp_horas",
+                    label_visibility="collapsed"
+                )
+
+            with col_minutos:
+                st.caption("Minutos")
+                minutos_editados = st.number_input(
+                    "Minutos",
+                    min_value=0,
+                    max_value=59,
+                    value=minutos_iniciales,
+                    step=1,
+                    key="nueva_imp_minutos",
+                    label_visibility="collapsed"
+                )
+
+            tiempo_editado = horas_editadas + minutos_editados / 60
+
+            with col_colores:
+                st.caption("🧵 Colores / filamentos")
+                materiales_editor = st.data_editor(
+                    editor_base,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    hide_index=True,
+                    height=max(120, min(250, 38 + 35 * max(len(editor_base), 1))),
+                    key=(
+                        f"editor_materiales_"
+                        f"{st.session_state.get('materiales_editor_version', 0)}"
+                    ),
+                    column_config={
+                        "Color": st.column_config.SelectboxColumn(
+                            "Color",
+                            options=opciones_editor,
+                            required=True,
+                            width="large",
+                            help=(
+                                "Solo aparecen colores/materiales que actualmente "
+                                "tienen stock disponible."
+                            )
+                        ),
+                        "Gramos": st.column_config.NumberColumn(
+                            "Gramos",
+                            min_value=0.0,
+                            step=1.0,
+                            format="%.0f g",
+                            width="small"
+                        )
+                    }
+                )
+
+            # Convertimos la selección visible del inventario a Material + Color.
+            filas_reales = []
+            filas_sin_color = 0
+            for _, fila_editada in materiales_editor.iterrows():
+                etiqueta = str(fila_editada.get("Color", opcion_vacia))
+                gramos_modelo = numero_seguro(fila_editada.get("Gramos", 0))
+                info = opciones_inventario.get(etiqueta)
+
+                if info is None:
+                    filas_sin_color += 1
+                    filas_reales.append({
+                        "Material": "",
+                        "Color": "",
+                        "Gramos modelo": gramos_modelo
+                    })
+                else:
+                    filas_reales.append({
+                        "Material": info["Material"],
+                        "Color": info["Color"],
+                        "Gramos modelo": gramos_modelo
+                    })
+
+            materiales_reales = pd.DataFrame(filas_reales)
+
+            if not materiales_reales.empty:
+                # Guardamos las selecciones reales para que persistan en reruns.
+                st.session_state["materiales_plan"] = materiales_reales.copy()
+
+            # ---------------------------------------------------------
+            # Purga automática: 5% si finalmente se usa un solo color,
+            # 10% si se usan dos o más. Siempre editable.
+            # ---------------------------------------------------------
+            seleccionados_validos = materiales_reales[
+                (materiales_reales["Material"].astype(str).str.len() > 0)
+                & (materiales_reales["Color"].astype(str).str.len() > 0)
+            ] if not materiales_reales.empty else pd.DataFrame()
+
+            combinaciones_usadas = (
+                seleccionados_validos[["Material", "Color"]]
+                .drop_duplicates()
+                if not seleccionados_validos.empty
+                else pd.DataFrame()
+            )
+
+            purga_sugerida = 5.0 if len(combinaciones_usadas) <= 1 else 10.0
+
+            if "purga_manual" not in st.session_state:
+                st.session_state["purga_manual"] = False
+
+            sugerida_anterior = st.session_state.get("purga_sugerida_anterior")
+            if (
+                "purga_pct" not in st.session_state
+                or (
+                    not st.session_state.get("purga_manual", False)
+                    and sugerida_anterior != purga_sugerida
+                )
+            ):
+                st.session_state["purga_pct"] = purga_sugerida
+
+            st.session_state["purga_sugerida_anterior"] = purga_sugerida
+
+            peso_modelo = (
+                float(materiales_reales["Gramos modelo"].fillna(0).sum())
+                if not materiales_reales.empty else 0.0
+            )
+
+            purga_pct = st.session_state.get("purga_pct", purga_sugerida)
+            purga_total = peso_modelo * purga_pct / 100
+            consumo_total = peso_modelo + purga_total
+
+            costo_material = consumo_total / 1000 * precio_filamento_kg
+            costo_electricidad = (
+                tiempo_editado * consumo_impresora_w / 1000 * precio_kwh
+            )
+            costo_depreciacion = (
+                tiempo_editado * precio_impresora / vida_util_horas
+            )
+            costo_total = costo_material + costo_electricidad + costo_depreciacion
+
+            with col_total:
+                st.caption("💰 Costo total")
+                st.markdown(f"## {formatear_clp(costo_total)}")
+                st.caption(f"Modelo: {peso_modelo:.0f} g")
+                st.caption(f"Consumo estimado: {consumo_total:.0f} g")
+                st.number_input(
+                    "Purga estimada (%)",
+                    min_value=0.0,
+                    max_value=300.0,
+                    step=1.0,
+                    key="purga_pct",
+                    on_change=marcar_purga_manual,
+                    help=(
+                        f"Sugerencia automática actual: {purga_sugerida:.0f}% "
+                        "(5% un color / 10% multicolor). Puedes editarla."
+                    )
+                )
+
+            # El number_input puede haber cambiado en esta misma ejecución;
+            # recalculamos con el valor definitivo.
+            purga_pct = numero_seguro(st.session_state.get("purga_pct", purga_sugerida))
+            purga_total = peso_modelo * purga_pct / 100
+            consumo_total = peso_modelo + purga_total
+
+            # Repartimos la purga proporcionalmente entre los colores elegidos.
+            if not materiales_reales.empty:
+                materiales_reales["Purga extra"] = 0.0
+                if peso_modelo > 0:
+                    materiales_reales["Purga extra"] = (
+                        materiales_reales["Gramos modelo"] / peso_modelo * purga_total
+                    )
+                materiales_reales["Total a descontar"] = (
+                    materiales_reales["Gramos modelo"]
+                    + materiales_reales["Purga extra"]
+                )
+
+            necesidades = agrupar_necesidades_inventario(materiales_reales)
+            faltantes = validar_stock(necesidades, inventario_actual)
+
+            # ---------------------------------------------------------
+            # Todo en un solo color: solo ofrece stock que realmente existe.
+            # ---------------------------------------------------------
+            if etiquetas_disponibles:
+                with st.expander("🎨 Usar un solo color para toda la impresión"):
+                    unico1, unico2 = st.columns([3, 1])
+                    with unico1:
+                        opcion_unica = st.selectbox(
+                            "Color / filamento disponible",
+                            etiquetas_disponibles,
+                            key="filamento_unico"
+                        )
+                    with unico2:
+                        st.write("")
+                        st.write("")
+                        if st.button(
+                            "Aplicar a todos",
+                            use_container_width=True,
+                            key="aplicar_filamento_unico"
+                        ):
+                            info_unica = opciones_inventario[opcion_unica]
+                            nuevo_plan = plan_df.copy()
+                            nuevo_plan["Material"] = info_unica["Material"]
+                            nuevo_plan["Color"] = info_unica["Color"]
+                            st.session_state["materiales_plan"] = nuevo_plan[
+                                ["Material", "Color", "Gramos modelo"]
+                            ].copy()
+                            st.session_state["materiales_editor_version"] = (
+                                st.session_state.get("materiales_editor_version", 0) + 1
+                            )
+                            # Si la purga no fue personalizada, pasará sola a 5%.
+                            st.rerun()
+
+            # ---------------------------------------------------------
+            # Revisión compacta de stock.
+            # ---------------------------------------------------------
+            if filas_sin_color:
+                st.warning(
+                    "⚠️ Selecciona un color disponible para todas las filas antes "
+                    "de guardar la impresión."
+                )
+
+            if necesidades:
+                resumen_stock = []
+                for (material, color), necesario in necesidades.items():
+                    disponible = stock_disponible(material, color, inventario_actual)
+                    resumen_stock.append({
+                        "Color": f"{emoji_color(color)} {color} ({material})",
+                        "Necesario": necesario,
+                        "Disponible": disponible,
+                        "Quedaría": disponible - necesario
+                    })
+
+                with st.expander(
+                    "📦 Revisar stock después de esta impresión",
+                    expanded=bool(faltantes)
+                ):
+                    st.dataframe(
+                        pd.DataFrame(resumen_stock),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Necesario": st.column_config.NumberColumn(format="%.0f g"),
+                            "Disponible": st.column_config.NumberColumn(format="%.0f g"),
+                            "Quedaría": st.column_config.NumberColumn(format="%.0f g")
+                        }
+                    )
+
+            if faltantes:
+                for f in faltantes:
+                    st.error(
+                        f"⚠️ No alcanza {f['Color']} ({f['Material']}): "
+                        f"necesitas {f['Necesario']:.0f} g y hay "
+                        f"{f['Disponible']:.0f} g. Faltan {f['Faltan']:.0f} g."
+                    )
+
+            # El desglose queda disponible sin ocupar espacio permanentemente.
+            with st.expander("💰 Ver desglose de costos"):
+                d1, d2, d3, d4 = st.columns(4)
+                with d1:
+                    st.metric("🧵 Material", formatear_clp(costo_material))
+                with d2:
+                    st.metric("⚡ Electricidad", formatear_clp(costo_electricidad))
+                with d3:
+                    st.metric("🖨️ Depreciación", formatear_clp(costo_depreciacion))
+                with d4:
+                    st.metric(
+                        "🗑️ Purga",
+                        f"{purga_total:.0f} g ({purga_pct:.0f}%)"
+                    )
+
+            ganancia = 0
+            if destino_actual == "Venta":
+                ganancia = precio_venta_actual - costo_total
+                st.metric("📈 Ganancia estimada", formatear_clp(ganancia))
+
+            st.divider()
+            fecha_impresion = st.date_input(
+                "Fecha", value=date.today(), format="DD/MM/YYYY"
+            )
+
+            if st.button(
+                "💾 Guardar impresión",
+                type="primary",
+                disabled=(
+                    bool(faltantes)
+                    or not bool(necesidades)
+                    or filas_sin_color > 0
+                    or not bool(etiquetas_disponibles)
+                )
+            ):
+                # Revalidamos justo antes de guardar por si otra persona usó stock.
+                inventario_ultimo = cargar_inventario()
+                faltantes_ultimo = validar_stock(necesidades, inventario_ultimo)
+
+                if faltantes_ultimo:
+                    st.error(
+                        "El stock cambió antes de guardar. Revisa nuevamente el inventario."
+                    )
+                else:
+                    materiales_json = json.dumps(
+                        materiales_reales.fillna("").to_dict(orient="records"),
+                        ensure_ascii=False
+                    )
+
+                    impresion_id = guardar_impresion(
+                        fecha_impresion.isoformat(),
+                        destino_actual,
+                        st.session_state["link_calculado"],
+                        resultado["modelo"],
+                        resultado["perfil"],
+                        tiempo_editado,
+                        peso_modelo,
+                        materiales_json,
+                        costo_material,
+                        costo_electricidad,
+                        costo_depreciacion,
+                        costo_total,
+                        precio_venta_actual,
+                        ganancia
+                    )
+
+                    try:
+                        descontar_inventario(necesidades, impresion_id)
+                    except Exception:
+                        # Si falla el descuento, quitamos la impresión recién creada
+                        # para no dejar un registro que no consumió inventario.
+                        eliminar_impresion(impresion_id)
+                        raise
+
+                    st.session_state["mensaje"] = (
+                        f"Impresión #{impresion_id} guardada para {destino_actual} "
+                        f"y stock descontado ✅"
+                    )
+
+                    for clave in ["resultado", "materiales_plan"]:
+                        st.session_state.pop(clave, None)
+                    st.rerun()
+
+
+# =========================================================
+# INVENTARIO
+# =========================================================
+
+if pagina_activa == "🧵 Inventario":
+    st.subheader("🧵 Inventario de filamento")
+    st.caption(
+        "Registra los rollos que compran. Las impresiones descuentan automáticamente "
+        "el consumo real (modelo + purga) desde los lotes más antiguos."
+    )
+
+    inventario = cargar_inventario()
+
+    total_disponible = (
+        inventario["gramos_disponibles"].fillna(0).sum()
+        if not inventario.empty else 0
+    )
+    total_inicial = (
+        inventario["gramos_iniciales"].fillna(0).sum()
+        if not inventario.empty else 0
+    )
+
+    i1, i2, i3 = st.columns(3)
+    with i1:
+        st.metric("Stock disponible", f"{total_disponible / 1000:.2f} kg")
+    with i2:
+        st.metric("Equivalente", f"{total_disponible / 1000:.2f} rollos de 1 kg")
+    with i3:
+        consumido_hist = max(0.0, total_inicial - total_disponible)
+        st.metric("Consumido / ajustado", f"{consumido_hist / 1000:.2f} kg")
+
+    st.divider()
+    st.write("### ➕ Agregar compra de filamento")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        inv_material = st.selectbox("Material", MATERIALES_FILAMENTO, key="inv_material")
+        inv_color = st.text_input(
+            "Color", placeholder="Ej: Negro / Blanco / Burgundy", key="inv_color"
+        )
+    with c2:
+        inv_rollos = st.number_input(
+            "Cantidad de rollos", min_value=1, value=1, step=1, key="inv_rollos"
+        )
+        inv_gramos_rollo = st.number_input(
+            "Gramos por rollo", min_value=1, value=1000, step=50, key="inv_gramos_rollo"
+        )
+    with c3:
+        inv_marca = st.text_input("Marca (opcional)", key="inv_marca")
+        inv_fecha = st.date_input(
+            "Fecha de compra", value=date.today(), format="DD/MM/YYYY", key="inv_fecha"
+        )
+
+    inv_precio = st.number_input(
+        "Precio total de la compra (opcional)", min_value=0, value=0, step=1000,
+        key="inv_precio"
+    )
+    inv_nota = st.text_input("Nota (opcional)", key="inv_nota")
+
+    total_compra_g = inv_rollos * inv_gramos_rollo
+    st.info(
+        f"Se agregarán **{inv_rollos} rollo(s)** = **{total_compra_g / 1000:.2f} kg** "
+        f"de {inv_material} {inv_color.strip().upper() if inv_color.strip() else '—'}."
+    )
+
+    if st.button("📦 Agregar al inventario", type="primary"):
+        if not inv_color.strip():
+            st.error("Escribe el color del filamento.")
+        else:
+            agregar_filamento(
+                inv_fecha.isoformat(), inv_material, inv_color, inv_rollos,
+                inv_gramos_rollo, inv_precio, inv_marca, inv_nota
+            )
+            st.session_state["mensaje"] = (
+                f"Agregados {inv_rollos} rollo(s) de {inv_material} "
+                f"{inv_color.strip().upper()} al inventario ✅"
+            )
+            st.rerun()
+
+    st.divider()
+    st.write("### 📦 Stock actual")
+
+    if inventario.empty:
+        st.info("Todavía no hay rollos registrados.")
+    else:
+        resumen_inv = (
+            inventario.groupby(["material", "color"], as_index=False)
+            .agg(
+                Stock_g=("gramos_disponibles", "sum"),
+                Comprado_g=("gramos_iniciales", "sum"),
+                Lotes=("id", "count")
+            )
+            .sort_values(["material", "color"])
+        )
+        resumen_inv["Stock_kg"] = resumen_inv["Stock_g"] / 1000
+        resumen_inv["Estado"] = resumen_inv["Stock_g"].apply(
+            lambda x: "⚠️ Stock bajo" if x <= STOCK_BAJO_G else "✅ OK"
+        )
+        resumen_mostrar = resumen_inv[
+            ["material", "color", "Stock_g", "Stock_kg", "Lotes", "Estado"]
+        ].copy()
+        resumen_mostrar.columns = [
+            "Material", "Color", "Stock (g)", "Stock (kg)", "Lotes", "Estado"
+        ]
+        st.dataframe(
+            resumen_mostrar,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Stock (g)": st.column_config.NumberColumn(format="%.0f g"),
+                "Stock (kg)": st.column_config.NumberColumn(format="%.2f kg")
             }
         )
 
-        peso_total = (
-            materiales_editados["Gramos"]
-            .fillna(0)
-            .sum()
+        bajos = resumen_inv[resumen_inv["Stock_g"] <= STOCK_BAJO_G]
+        for _, fila in bajos.iterrows():
+            st.warning(
+                f"Stock bajo: {fila['material']} {fila['color']} — "
+                f"quedan {fila['Stock_g']:.0f} g."
+            )
+
+        with st.expander("🔧 Ajustar stock de un lote"):
+            opciones_lotes = {}
+            for _, lote in inventario.iterrows():
+                etiqueta = (
+                    f"Lote #{int(lote['id'])} | {lote['material']} {lote['color']} | "
+                    f"{numero_seguro(lote['gramos_disponibles']):.0f} g disponibles"
+                )
+                opciones_lotes[etiqueta] = int(lote["id"])
+
+            etiqueta_lote = st.selectbox("Lote", list(opciones_lotes.keys()))
+            lote_id = opciones_lotes[etiqueta_lote]
+            lote_sel = inventario[inventario["id"] == lote_id].iloc[0]
+            nuevo_stock = st.number_input(
+                "Stock real disponible (g)",
+                min_value=0.0,
+                value=numero_seguro(lote_sel["gramos_disponibles"]),
+                step=1.0,
+                key=f"ajuste_stock_{lote_id}"
+            )
+            motivo_ajuste = st.text_input(
+                "Motivo", placeholder="Ej: pesamos el rollo / merma / corrección"
+            )
+            if st.button("Guardar ajuste de stock"):
+                ajustar_stock_inventario(lote_id, nuevo_stock, motivo_ajuste)
+                st.session_state["mensaje"] = "Stock ajustado ✅"
+                st.rerun()
+
+    st.divider()
+    st.write("### 🧾 Movimientos recientes")
+    movimientos = cargar_movimientos_inventario()
+    if movimientos.empty:
+        st.info("Todavía no hay movimientos de inventario.")
+    else:
+        tabla_mov = movimientos.copy()
+        tabla_mov["fecha"] = tabla_mov["fecha"].dt.strftime("%d/%m/%Y %H:%M")
+        tabla_mov = tabla_mov[
+            ["fecha", "tipo", "material", "color", "cantidad_g", "impresion_id", "detalle"]
+        ]
+        tabla_mov.columns = [
+            "Fecha", "Tipo", "Material", "Color", "Movimiento (g)", "Impresión", "Detalle"
+        ]
+        st.dataframe(
+            tabla_mov,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Movimiento (g)": st.column_config.NumberColumn(format="%+.0f g")
+            }
         )
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.metric(
-                "⚖️ Peso total",
-                f"{peso_total:.0f} g"
-            )
-
-        with c2:
-            st.metric(
-                "⏱️ Tiempo",
-                formatear_duracion(tiempo_editado)
-            )
-
-        costo_material = (
-            peso_total / 1000 * precio_filamento_kg
-        )
-
-        costo_electricidad = (
-            tiempo_editado
-            * consumo_impresora_w
-            / 1000
-            * precio_kwh
-        )
-
-        costo_depreciacion = (
-            tiempo_editado
-            * precio_impresora
-            / vida_util_horas
-        )
-
-        costo_total = (
-            costo_material
-            + costo_electricidad
-            + costo_depreciacion
-        )
-
-        st.divider()
-        st.write("## 💰 Costos de impresión")
-
-        a, b, c, d = st.columns(4)
-
-        with a:
-            st.metric(
-                "🧵 Material",
-                formatear_clp(costo_material)
-            )
-
-        with b:
-            st.metric(
-                "⚡ Electricidad",
-                formatear_clp(costo_electricidad)
-            )
-
-        with c:
-            st.metric(
-                "🖨️ Depreciación",
-                formatear_clp(costo_depreciacion)
-            )
-
-        with d:
-            st.metric(
-                "💰 Costo total",
-                formatear_clp(costo_total)
-            )
-
-        ganancia = 0
-
-        if destino_actual == "Venta":
-            ganancia = precio_venta_actual - costo_total
-
-            st.metric(
-                "📈 Ganancia estimada",
-                formatear_clp(ganancia)
-            )
-
-        st.divider()
-
-        fecha_impresion = st.date_input(
-            "Fecha",
-            value=date.today(),
-            format="DD/MM/YYYY"
-        )
-
-        if st.button(
-            "💾 Guardar impresión",
-            type="primary"
-        ):
-            materiales_json = json.dumps(
-                materiales_editados
-                .fillna("")
-                .to_dict(orient="records"),
-                ensure_ascii=False
-            )
-
-            guardar_impresion(
-                fecha_impresion.isoformat(),
-                destino_actual,
-                st.session_state["link_calculado"],
-                resultado["modelo"],
-                resultado["perfil"],
-                tiempo_editado,
-                peso_total,
-                materiales_json,
-                costo_material,
-                costo_electricidad,
-                costo_depreciacion,
-                costo_total,
-                precio_venta_actual,
-                ganancia
-            )
-
-            st.session_state["mensaje"] = (
-                f"Impresión guardada para "
-                f"{destino_actual} ✅"
-            )
-
-            del st.session_state["resultado"]
-            st.rerun()
 
 
 # =========================================================
@@ -2373,14 +3064,18 @@ if pagina_activa == "📋 Historial":
                 editar_horas = editar_horas_enteras + editar_minutos / 60
 
             with e2:
-                editar_gramos = st.number_input(
-                    "Gramos",
+                editar_gramos = numero_seguro(registro["gramos"])
+                st.number_input(
+                    "Gramos del modelo",
                     min_value=0.0,
-                    value=numero_seguro(
-                        registro["gramos"]
-                    ),
+                    value=editar_gramos,
                     step=1.0,
-                    key="editar_imp_gramos"
+                    disabled=True,
+                    key=f"editar_imp_gramos_{id_impresion}"
+                )
+                st.caption(
+                    "El consumo de material y la purga quedan amarrados al inventario "
+                    "y no se editan desde el historial."
                 )
 
                 editar_costo_texto = st.text_input(
@@ -2474,13 +3169,14 @@ if pagina_activa == "📋 Historial":
                             use_container_width=True,
                             key=f"confirmar_eliminar_imp_{id_impresion}"
                         ):
+                            devolver_stock_impresion(id_impresion)
                             eliminar_impresion(id_impresion)
                             st.session_state.pop(
                                 "confirmar_eliminar_imp_id",
                                 None
                             )
                             st.session_state["mensaje"] = (
-                                "Impresión eliminada 🗑️"
+                                "Impresión eliminada y filamento devuelto al inventario 🗑️🧵"
                             )
                             st.rerun()
 
